@@ -529,6 +529,11 @@ pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn pty_proxy_shell_pid(pane_pid: u32) -> u32 {
+    pane_pid
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn process_agent_hint(_pid: u32) -> Option<crate::detect::Agent> {
     None
 }

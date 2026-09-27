@@ -659,6 +659,55 @@ pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
     (tpgid > 0).then_some(tpgid as u32)
 }
 
+/// Look through a pty proxy such as `atuin pty-proxy`: a process that leads its
+/// terminal's foreground group and runs a session on a pty of its own, so the pane
+/// pty's foreground never leaves the proxy. Shells and agents are never proxies;
+/// their own pty children (zpty workers, agent tool sessions) are not the pane.
+pub fn pty_proxy_shell_pid(pane_pid: u32) -> u32 {
+    // After (comm): state(0) ppid(1) pgrp(2) session(3) tty_nr(4) tpgid(5)
+    let comm_tty_tpgid = |pid: u32| -> Option<(String, i32, i32)> {
+        // comm is raw bytes and may be cut mid-character.
+        let stat = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+        let stat = String::from_utf8_lossy(&stat);
+        let close = stat.rfind(')')?;
+        let comm = stat.get(stat.find('(')? + 1..close)?.to_string();
+        let fields: Vec<&str> = stat.get(close + 2..)?.split_whitespace().collect();
+        Some((
+            comm,
+            fields.get(4)?.parse().ok()?,
+            fields.get(5)?.parse().ok()?,
+        ))
+    };
+    let mut pid = pane_pid;
+    for _ in 0..4 {
+        let Some((name, tty, tpgid)) = comm_tty_tpgid(pid) else {
+            break;
+        };
+        if tty == 0
+            || tpgid != pid as i32
+            || super::is_pane_shell_process_name(&name)
+            || foreground_group_leader_job(pid)
+                .and_then(|job| crate::detect::identify_agent_in_job(&job))
+                .is_some()
+        {
+            break;
+        }
+        let mut budget = ForegroundScanBudget::for_probe();
+        let Some(inner) = process_task_ids(pid, &mut budget)
+            .into_iter()
+            .flat_map(|tid| process_task_children(pid, tid, &mut budget))
+            .find(|&child| {
+                comm_tty_tpgid(child)
+                    .is_some_and(|(_, child_tty, _)| child_tty != 0 && child_tty != tty)
+            })
+        else {
+            break;
+        };
+        pid = inner;
+    }
+    pid
+}
+
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     (pgid > 0).then_some(pgid as u32)

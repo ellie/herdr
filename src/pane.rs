@@ -997,7 +997,7 @@ fn spawn_basic_detection_task(
                 last_content_change_at = None;
             }
             release_was_active = suppressed_agent.is_some();
-            let pid = child_pid.load(Ordering::Acquire);
+            let pid = crate::platform::pty_proxy_shell_pid(child_pid.load(Ordering::Acquire));
             let mut agent_changed = false;
             let mut agent = agent_presence.current_agent();
             let lifecycle_authority_active =
@@ -2930,7 +2930,8 @@ impl PaneRuntime {
                         last_content_change_at = None;
                     }
                     release_was_active = suppressed_agent.is_some();
-                    let pid = child_pid.load(Ordering::Acquire);
+                    let pid =
+                        crate::platform::pty_proxy_shell_pid(child_pid.load(Ordering::Acquire));
                     let mut agent = agent_presence.current_agent();
                     let lifecycle_authority_active =
                         full_lifecycle_authority_active_for_task.load(Ordering::Acquire);
@@ -3781,12 +3782,12 @@ impl PaneRuntime {
             return Some(cwd);
         }
 
-        let pid = self.child_pid.load(Ordering::Relaxed);
+        let pid = crate::platform::pty_proxy_shell_pid(self.child_pid.load(Ordering::Relaxed));
         crate::platform::process_cwd(pid)
     }
 
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
-        let pid = self.child_pid.load(Ordering::Acquire);
+        let pid = crate::platform::pty_proxy_shell_pid(self.child_pid.load(Ordering::Acquire));
         let exited = self.cwd_process_exited.load(Ordering::Acquire);
         if let Some(cwd) = (!exited)
             .then(|| crate::platform::process_cwd(pid))
@@ -3807,17 +3808,29 @@ impl PaneRuntime {
     }
 
     pub fn child_pid(&self) -> Option<u32> {
-        let pid = self.child_pid.load(Ordering::Acquire);
+        let pid = crate::platform::pty_proxy_shell_pid(self.child_pid.load(Ordering::Acquire));
         (pid > 0).then_some(pid)
+    }
+
+    /// The pane shell and its foreground group, looking through a pty proxy that
+    /// runs the shell on a pty of its own.
+    #[cfg(unix)]
+    fn shell_foreground(&self) -> (u32, Option<u32>) {
+        let child_pid = self.child_pid.load(Ordering::Acquire);
+        let pid = crate::platform::pty_proxy_shell_pid(child_pid);
+        let pane_pty_pgid = (pid == child_pid)
+            .then(|| self.io.foreground_process_group_id())
+            .flatten();
+        (
+            pid,
+            pane_pty_pgid.or_else(|| crate::platform::foreground_process_group_id(pid)),
+        )
     }
 
     pub fn follow_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
-            let leader_cwd = self
-                .io
-                .foreground_process_group_id()
-                .and_then(usable_process_cwd);
+            let leader_cwd = self.shell_foreground().1.and_then(usable_process_cwd);
             leader_cwd.or_else(|| self.cwd())
         }
 
@@ -3831,12 +3844,8 @@ impl PaneRuntime {
     pub fn foreground_cwd(&self) -> Option<std::path::PathBuf> {
         #[cfg(unix)]
         {
-            let pid = self.child_pid.load(Ordering::Acquire);
+            let (pid, foreground_pgid) = self.shell_foreground();
             let shell_cwd = absolute_process_cwd(pid);
-            let foreground_pgid = self
-                .io
-                .foreground_process_group_id()
-                .or_else(|| crate::platform::foreground_process_group_id(pid));
             let leader_cwd = foreground_pgid.and_then(absolute_process_cwd);
 
             // The group leader's cwd is authoritative (issue #3270): a helper

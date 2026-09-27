@@ -170,6 +170,7 @@ pub(crate) fn write_config_temporary(
 }
 
 const PROC_PGRP_ONLY: u32 = 2;
+const PROC_PPID_ONLY: u32 = 6;
 const SERVER_NOFILE_LIMIT_TARGET: libc::rlim_t = 8192;
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
@@ -426,7 +427,7 @@ pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
     let fg_pgid = foreground_process_group_id(child_pid)?;
     let mut processes = Vec::new();
 
-    for pid in process_group_pids(fg_pgid) {
+    for pid in listed_pids(PROC_PGRP_ONLY, fg_pgid) {
         let Some(info) = process_bsdinfo(pid) else {
             continue;
         };
@@ -477,7 +478,7 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
     })
 }
 
-fn process_group_pids(process_group_id: u32) -> Vec<u32> {
+fn listed_pids(kind: u32, id: u32) -> Vec<u32> {
     let mut capacity = 16usize;
 
     for _ in 0..8 {
@@ -485,8 +486,8 @@ fn process_group_pids(process_group_id: u32) -> Vec<u32> {
         let buffer_bytes = pids.len() * std::mem::size_of::<libc::pid_t>();
         let returned_bytes = unsafe {
             libc::proc_listpids(
-                PROC_PGRP_ONLY,
-                process_group_id,
+                kind,
+                id,
                 pids.as_mut_ptr() as *mut libc::c_void,
                 buffer_bytes as libc::c_int,
             )
@@ -533,6 +534,36 @@ pub fn foreground_process_group_id(pid: u32) -> Option<u32> {
     } else {
         None
     }
+}
+
+/// Look through a pty proxy such as `atuin pty-proxy`: a process that leads its
+/// terminal's foreground group and runs a session on a pty of its own, so the pane
+/// pty's foreground never leaves the proxy. Shells and agents are never proxies;
+/// their own pty children (zpty workers, agent tool sessions) are not the pane.
+pub fn pty_proxy_shell_pid(pane_pid: u32) -> u32 {
+    let mut pid = pane_pid;
+    for _ in 0..4 {
+        let Some(info) = process_bsdinfo(pid) else {
+            break;
+        };
+        if info.e_tdev == u32::MAX
+            || info.e_tpgid != pid
+            || comm_from_bsdinfo(&info).is_none_or(|name| super::is_pane_shell_process_name(&name))
+            || foreground_group_leader_job(pid)
+                .and_then(|job| crate::detect::identify_agent_in_job(&job))
+                .is_some()
+        {
+            break;
+        }
+        let Some(inner) = listed_pids(PROC_PPID_ONLY, pid).into_iter().find(|&child| {
+            process_bsdinfo(child)
+                .is_some_and(|child| child.e_tdev != u32::MAX && child.e_tdev != info.e_tdev)
+        }) else {
+            break;
+        };
+        pid = inner;
+    }
+    pid
 }
 
 pub fn foreground_process_group_id_for_tty_fd(fd: RawFd) -> Option<u32> {
